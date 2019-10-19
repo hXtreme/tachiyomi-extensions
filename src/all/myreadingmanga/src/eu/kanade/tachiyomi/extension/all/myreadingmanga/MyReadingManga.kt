@@ -1,13 +1,15 @@
 package eu.kanade.tachiyomi.extension.all.myreadingmanga
-
 import android.net.Uri
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.model.*
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import okhttp3.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import rx.Observable
+import java.io.IOException
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -69,11 +71,20 @@ open class MyReadingManga(override val lang: String) : ParsedHttpSource() {
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
 
         val query2 = URLEncoder.encode(query, "UTF-8")
-        val uri = Uri.parse("$baseUrl/search/").buildUpon()
+        val uri = if (query.isNotBlank()) {
+            Uri.parse("$baseUrl/search/").buildUpon()
                 .appendEncodedPath(query2)
-                .appendPath("page")
-                .appendPath("$page")
-        return GET(uri.toString())
+        } else {
+            val uri = Uri.parse("$baseUrl/").buildUpon()
+            //Append uri filters
+            filters.forEach {
+                if (it is UriFilter)
+                    it.addToUri(uri)
+            }
+            uri
+        }
+        uri.appendPath("page").appendPath("$page")
+        return GET(uri.toString(), headers)
     }
 
 
@@ -110,7 +121,17 @@ open class MyReadingManga(override val lang: String) : ParsedHttpSource() {
     private fun cleanTitle(title: String) = title.substringBeforeLast("[").substringAfterLast("]").substringBeforeLast("(")
     private fun cleanAuthor(title: String) = title.substringAfter("[").substringBefore("]")
 
-    override fun mangaDetailsParse(document: Document): SManga {
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
+        val needCover = manga.thumbnail_url.isNullOrEmpty()
+
+        return client.newCall(mangaDetailsRequest(manga))
+            .asObservableSuccess()
+            .map { response ->
+                mangaDetailsParse(response.asJsoup(), needCover).apply { initialized = true }
+            }
+    }
+
+    private fun mangaDetailsParse(document: Document, needCover: Boolean): SManga {
         val manga = SManga.create()
         manga.author = cleanAuthor(document.select("h1").text())
         manga.artist = cleanAuthor(document.select("h1").text())
@@ -122,8 +143,16 @@ open class MyReadingManga(override val lang: String) : ParsedHttpSource() {
             "Completed" -> SManga.COMPLETED
             else -> SManga.UNKNOWN
         }
+
+        if (needCover) {
+            manga.thumbnail_url = getThumbnail(client.newCall(GET("$baseUrl/search/?search=${document.location()}", headers))
+                .execute().asJsoup().select("div.wdm_results div.p_content img").first().attr("abs:src"))
+        }
+
         return manga
     }
+
+    override fun mangaDetailsParse(document: Document) = throw Exception("Not used")
 
     override fun chapterListSelector() = ".entry-pagination a"
 
@@ -134,15 +163,16 @@ open class MyReadingManga(override val lang: String) : ParsedHttpSource() {
         val date = parseDate(document.select(".entry-time").text())
         val mangaUrl = document.baseUri()
         val chfirstname = document.select(".chapter-class a[href*=$mangaUrl]")?.first()?.text()?.ifEmpty { "Ch. 1" }?.capitalize() ?:"Ch. 1"
+        val scangroup= document.select(".entry-terms a[href*=group]")?.first()?.text()
         //create first chapter since its on main manga page
-        chapters.add(createChapter("1", document.baseUri(), date, chfirstname))
+        chapters.add(createChapter("1", document.baseUri(), date, chfirstname, scangroup))
         //see if there are multiple chapters or not
         document.select(chapterListSelector())?.let { it ->
             it.forEach {
                 if (!it.text().contains("Next »", true)) {
                     val pageNumber = it.text()
                     val chname = document.select(".chapter-class a[href$=/$pageNumber/]")?.text()?.ifEmpty { "Ch. $pageNumber" }?.capitalize() ?:"Ch. $pageNumber"
-                    chapters.add(createChapter(it.text(), document.baseUri(), date, chname))
+                    chapters.add(createChapter(it.text(), document.baseUri(), date, chname, scangroup))
                 }
             }
         }
@@ -155,11 +185,12 @@ open class MyReadingManga(override val lang: String) : ParsedHttpSource() {
         return SimpleDateFormat("MMM dd, yyyy", Locale.US ).parse(date).time
     }
 
-    private fun createChapter(pageNumber: String, mangaUrl: String, date: Long, chname: String): SChapter {
+    private fun createChapter(pageNumber: String, mangaUrl: String, date: Long, chname: String, scangroup: String?): SChapter {
         val chapter = SChapter.create()
         chapter.setUrlWithoutDomain("$mangaUrl/$pageNumber")
         chapter.name = chname
         chapter.date_upload = date
+        chapter.scanlator = scangroup
         return chapter
     }
 
@@ -182,4 +213,60 @@ open class MyReadingManga(override val lang: String) : ParsedHttpSource() {
     override fun imageUrlRequest(page: Page) = throw Exception("Not used")
     override fun imageUrlParse(document: Document) = throw Exception("Not used")
 
+    //Filter Parsing, grabs home page as document and filters out Genres, Popular Tags, and Catagorys
+    private val filterdoc:Document? = try { OkHttpClient().newCall(GET("$baseUrl", headers)).execute().asJsoup() } catch (e: IOException) {null}
+    private val genresarray = filterdoc?.select(".tagcloud a[href*=/genre/]")?.map { Pair(it.attr("href").substringBeforeLast("/").substringAfterLast("/"), it.text())}?.toTypedArray() ?: arrayOf(Pair("","Error getting filters, try restarting app"))
+    private val poptagarray = filterdoc?.select(".tagcloud a[href*=/tag/]")?.map { Pair(it.attr("href").substringBeforeLast("/").substringAfterLast("/"), it.text())}?.toTypedArray() ?: arrayOf(Pair("","Error getting filters, try restarting app"))
+    private val cattagarray = filterdoc?.select(".level-0")?.map { Pair(it.attr("value"), it.text())}?.toTypedArray() ?: arrayOf(Pair("","Error getting filters, try restarting app"))
+    
+    //Generates the filter lists for app
+    override fun getFilterList(): FilterList {
+        val filterList = FilterList(
+            //MRM does not support genre filtering and text search at the same time
+            Filter.Header("NOTE: Filters are ignored if using text search."),
+            Filter.Header("Only one filter can be used at a time."),
+            GenreFilter(genresarray),
+            TagFilter(poptagarray),
+            CatFilter(cattagarray)
+        )
+        return filterList
+    }
+
+    private class GenreFilter(GENRES: Array<Pair<String, String>>) : UriSelectFilterPath("Genre", "genre", arrayOf(Pair("","Any"),*GENRES))
+    private class TagFilter(POPTAG: Array<Pair<String, String>>) : UriSelectFilterPath("Popular Tags", "tag", arrayOf(Pair("","Any"),*POPTAG))
+    private class CatFilter(CATID: Array<Pair<String, String>>) : UriSelectFilterQuery("Categories", "cat", arrayOf(Pair("","Any"), *CATID))
+
+    /**
+     * Class that creates a select filter. Each entry in the dropdown has a name and a display name.
+     * If an entry is selected it is appended as a query parameter onto the end of the URI.
+     * If `firstIsUnspecified` is set to true, if the first entry is selected, nothing will be appended on the the URI.
+     */
+    //vals: <name, display>
+    private open class UriSelectFilterPath(displayName: String, val uriParam: String, val vals: Array<Pair<String, String>>,
+                                       val firstIsUnspecified: Boolean = true,
+                                       defaultValue: Int = 0) :
+        Filter.Select<String>(displayName, vals.map { it.second }.toTypedArray(), defaultValue), UriFilter {
+        override fun addToUri(uri: Uri.Builder) {
+            if (state != 0 || !firstIsUnspecified)
+                uri.appendPath(uriParam)
+                    .appendPath(vals[state].first)
+        }
+    }
+    private open class UriSelectFilterQuery(displayName: String, val uriParam: String, val vals: Array<Pair<String, String>>,
+                                       val firstIsUnspecified: Boolean = true,
+                                       defaultValue: Int = 0) :
+        Filter.Select<String>(displayName, vals.map { it.second }.toTypedArray(), defaultValue), UriFilter {
+        override fun addToUri(uri: Uri.Builder) {
+            if (state != 0 || !firstIsUnspecified)
+                uri.appendQueryParameter(uriParam, vals[state].first)
+        }
+    }
+
+    /**
+     * Represents a filter that is able to modify a URI.
+     */
+    private interface UriFilter {
+        fun addToUri(uri: Uri.Builder)
+    }
+    
 }

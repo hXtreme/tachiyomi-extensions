@@ -4,14 +4,12 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.*
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import okhttp3.HttpUrl
-import okhttp3.Request
-import okhttp3.Response
+import okhttp3.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.*
 
-abstract class Webtoons(override val lang: String) : ParsedHttpSource() {
+abstract class Webtoons(override val lang: String, open val langCode: String = lang) : ParsedHttpSource() {
 
     override val name = "Webtoons.com"
 
@@ -40,21 +38,22 @@ abstract class Webtoons(override val lang: String) : ParsedHttpSource() {
     override fun latestUpdatesSelector() = "div#dailyList > $day li > a:has(span:contains(UP))"
 
     override fun headersBuilder() = super.headersBuilder()
-            .add("Referer", "http://www.webtoons.com/en/")
+            .add("Referer", "http://www.webtoons.com/$langCode/")
 
     protected val mobileHeaders = super.headersBuilder()
             .add("Referer", "http://m.webtoons.com")
             .build()
 
-    override fun popularMangaRequest(page: Int) = GET("$baseUrl/en/top", headers)
+    override fun popularMangaRequest(page: Int) = GET("$baseUrl/$langCode/top", headers)
 
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/en/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
+    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/$langCode/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
     private fun mangaFromElement(query: String, element: Element): SManga {
         val manga = SManga.create()
         element.select(query).first().let {
             manga.setUrlWithoutDomain(it.attr("href"))
             manga.title = it.select("p.subj").text()
+            manga.thumbnail_url = it.select(".pic_area > img")?.attr("src")
         }
         return manga
     }
@@ -70,7 +69,7 @@ abstract class Webtoons(override val lang: String) : ParsedHttpSource() {
         return manga
     }
 
-    override fun popularMangaNextPageSelector() = null
+    override fun popularMangaNextPageSelector() : String? = null
 
     override fun latestUpdatesNextPageSelector() = null
 
@@ -117,8 +116,8 @@ abstract class Webtoons(override val lang: String) : ParsedHttpSource() {
         val discoverPic = document.select("#content > div.cont_box > div.detail_header > span.thmb")
 
         val manga = SManga.create()
-        manga.author = detailElement.select(".author:nth-of-type(1)").text().substringBefore("author info")
-        manga.artist = detailElement.select(".author:nth-of-type(2)").first()?.text()?.substringBefore("author info") ?: manga.author
+        manga.author = detailElement.select(".author:nth-of-type(1)").first()?.ownText()
+        manga.artist = detailElement.select(".author:nth-of-type(2)").first()?.ownText() ?: manga.author
         manga.genre = detailElement.select(".genre").map { it.text() }.joinToString(", ")
         manga.description = infoElement.select("p.summary").text()
         manga.status = infoElement.select("p.day_info").text().orEmpty().let { parseStatus(it) }

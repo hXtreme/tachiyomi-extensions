@@ -22,10 +22,11 @@ class TuMangaOnline : ParsedHttpSource() {
 
     override val supportsLatest = true
 
-    private val rateLimitInterceptor = RateLimitInterceptor(4)
+    private val rateLimitInterceptor = RateLimitInterceptor(2)
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .addNetworkInterceptor(rateLimitInterceptor).connectTimeout(1, TimeUnit.MINUTES)
+        .addNetworkInterceptor(rateLimitInterceptor)
+        .connectTimeout(1, TimeUnit.MINUTES)
         .readTimeout(1, TimeUnit.MINUTES)
         .retryOnConnectionFailure(true)
         .followRedirects(true)
@@ -59,7 +60,7 @@ class TuMangaOnline : ParsedHttpSource() {
     override fun popularMangaRequest(page: Int) = GET("$baseUrl/library?order_item=likes_count&order_dir=desc&type=&filter_by=title&page=$page", headers)
 
     //override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/library?order_item=creation&order_dir=desc&type=&filter_by=title&page=$page", headers)
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/?page=$page&uploads_mode=thumbnail#latest_uploads", headers)
+    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/latest_uploads?page=$page&uploads_mode=thumbnail", headers)
 
     override fun popularMangaFromElement(element: Element) = SManga.create().apply {
         element.select("div.element > a").let {
@@ -67,6 +68,17 @@ class TuMangaOnline : ParsedHttpSource() {
             title = it.select("h4.text-truncate").text()
             thumbnail_url = it.select("style").toString().substringAfter("('").substringBeforeLast("')")
         }
+    }
+    
+     override fun latestUpdatesParse(response: Response): MangasPage {
+        val document = response.asJsoup()
+        val mangas = document.select(latestUpdatesSelector())
+            .distinctBy { it.select("div.thumbnail-title > h4.text-truncate").text().trim() }
+            .map { latestUpdatesFromElement(it) }
+        val hasNextPage = latestUpdatesNextPageSelector().let { selector ->
+            document.select(selector).first()
+        } != null
+        return MangasPage(mangas, hasNextPage)
     }
 
     override fun latestUpdatesFromElement(element: Element) = SManga.create().apply {
@@ -179,7 +191,13 @@ class TuMangaOnline : ParsedHttpSource() {
         }
 
         // Regular list of chapters
-        return document.select(regularChapterListSelector()).map { regularChapterFromElement(it) }
+        val chapters = mutableListOf<SChapter>()
+        document.select(regularChapterListSelector()).forEach { chapelement ->
+            val chapternumber = chapelement.select("a.btn-collapse").text().substringBefore(":").substringAfter("Capítulo").trim().toFloat()
+            val chaptername = chapelement.select("div.col-10.text-truncate").text()
+            chapelement.select("ul.chapter-list > li").forEach { chapters.add(regularChapterFromElement(it, chaptername, chapternumber)) }
+        }
+        return chapters
     }
 
     override fun chapterListSelector() = throw UnsupportedOperationException("Not used")
@@ -196,9 +214,10 @@ class TuMangaOnline : ParsedHttpSource() {
 
     private fun regularChapterListSelector() = "div.chapters > ul.list-group li.p-0.list-group-item"
 
-    private fun regularChapterFromElement(element: Element) = SChapter.create().apply {
+    private fun regularChapterFromElement(element: Element, chname: String, number: Float) = SChapter.create().apply {
         setUrlWithoutDomain(element.select("div.row > .text-right > a").attr("href"))
-        name = element.select("div.col-10.text-truncate").text()
+        name = chname
+        chapter_number = number
         scanlator = element.select("div.col-md-6.text-truncate")?.text()
         date_upload = element.select("span.badge.badge-primary.p-2").first()?.text()?.let { parseChapterDate(it) } ?: 0
     }
